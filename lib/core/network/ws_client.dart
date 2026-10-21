@@ -6,7 +6,16 @@ import '../protocol/message_envelope.dart';
 import 'backoff.dart';
 
 /// 连接阶段。
-enum LanConnPhase { disconnected, connecting, connected, reconnecting }
+///
+/// [LanConnPhase.authFailed] 为不可恢复终态：服务端拒绝令牌（如已失效/被踢），
+/// 客户端不再自动重连，应转登录页重新获取 token。
+enum LanConnPhase {
+  disconnected,
+  connecting,
+  connected,
+  reconnecting,
+  authFailed,
+}
 
 /// 对外暴露的连接状态快照。
 class LanConnState {
@@ -40,16 +49,25 @@ class LanConnState {
 /// 通过 [messages] 流向上层。
 class LanWsClient {
   LanWsClient({
+    required this.userId,
     required this.deviceId,
     this.nickname = '',
+    this.token = '',
     BackoffStrategy? backoff,
     this.heartbeatInterval = const Duration(seconds: 15),
     FutureOr<WebSocketChannel> Function(Uri uri)? connector,
   }) : _backoff = backoff ?? BackoffStrategy(),
        _connector = connector ?? WebSocketChannel.connect;
 
+  /// 登录账号 id（阶段②起服务端据此校验 token；匿名直连将被拒绝）。
+  final String userId;
+
+  /// 设备标识：同一账号多设备会话时，服务端据此踢同设备旧连接。
   final String deviceId;
   String nickname;
+
+  /// 登录令牌；非空时随 hello 上报，服务端（阶段②起）据此鉴权。
+  final String token;
   final Duration heartbeatInterval;
 
   final BackoffStrategy _backoff;
@@ -122,6 +140,19 @@ class LanWsClient {
   /// 发送方收到 ack 后移除待确认消息。
   void acknowledge(String msgId) {
     _pending.remove(msgId);
+  }
+
+  /// 向服务端确认收到消息（离线补投的落盘凭证）。
+  ///
+  /// 直接发送、不进入待发队列——服务端不会对 ack 再回 ack。
+  void sendAck(String msgId) {
+    _sendNow(
+      MessageEnvelope(
+        type: MessageType.ack,
+        msgId: msgId,
+        timestamp: DateTime.now().millisecondsSinceEpoch,
+      ),
+    );
   }
 
   /// 当前未确认（待补发）消息数，可用于 UI 提示。
@@ -219,6 +250,22 @@ class LanWsClient {
       case MessageType.roster:
       case MessageType.chat:
         _messageController.add(envelope);
+      case MessageType.error:
+        _messageController.add(envelope);
+        // 服务端鉴权拒绝：进入终态并停止自动重连（上层应转登录页）。
+        final code = envelope.payload['code'];
+        if (code == 'INVALID_TOKEN' || code == 'UNAUTHORIZED') {
+          _running = false;
+          _generation += 1;
+          _setState(
+            LanConnState(
+              phase: LanConnPhase.authFailed,
+              address: _uri?.toString(),
+              error: '登录已失效，请重新登录',
+            ),
+          );
+          _signalClosed();
+        }
       case MessageType.hello:
       case MessageType.ping:
       case MessageType.unknown:
@@ -260,7 +307,12 @@ class LanWsClient {
       MessageEnvelope(
         type: MessageType.hello,
         timestamp: DateTime.now().millisecondsSinceEpoch,
-        payload: <String, dynamic>{'id': deviceId, 'nickname': nickname},
+        payload: <String, dynamic>{
+          'id': userId,
+          'deviceId': deviceId,
+          'nickname': nickname,
+          if (token.isNotEmpty) 'token': token,
+        },
       ),
     );
   }

@@ -2,8 +2,13 @@ import 'package:flutter/material.dart';
 
 /// 路由路径集中定义，供路由表与底部/侧边导航共用。
 abstract final class AppPaths {
+  static const String login = '/login';
+  static const String register = '/register';
   static const String connect = '/connect';
   static const String chat = '/chat';
+
+  /// 会话列表独立页（阶段⑧页面化；选中会话后回 /chat）。
+  static const String chats = '/chats';
   static const String settings = '/settings';
 }
 

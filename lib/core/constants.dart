@@ -7,9 +7,14 @@ abstract final class AppConstants {
   static const int defaultPort = 9090;
 
   // 本地持久化键名（shared_preferences）。
-  static const String prefKeyNickname = 'pref.nickname';
   static const String prefKeyServerHost = 'pref.server_host';
   static const String prefKeyDeviceId = 'pref.device_id';
+
+  /// 登录会话持久化（token + 账号资料；阶段③）。
+  static const String prefKeyAuthToken = 'pref.auth.token';
+  static const String prefKeyAuthUserId = 'pref.auth.user_id';
+  static const String prefKeyAuthUsername = 'pref.auth.username';
+  static const String prefKeyAuthNickname = 'pref.auth.nickname';
 
   /// 桌面端窗口最小尺寸。
   static const double windowMinWidth = 800;

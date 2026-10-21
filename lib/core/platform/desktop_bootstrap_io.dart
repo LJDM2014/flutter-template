@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:window_manager/window_manager.dart';
 
+import '../auth/account_store_io.dart';
 import '../constants.dart';
 import '../network/host_server.dart';
 
@@ -28,6 +29,8 @@ Future<void> bootstrapDesktop() async {
     await windowManager.show();
     await windowManager.focus();
   });
-  // 启动局域网中继服务，结果写入 RelayRuntime 供连接页展示。
-  RelayRuntime.status = await HostServer.instance.start();
+  // 启动局域网中继服务（含账号 REST 接口），结果写入 RelayRuntime 供连接页展示。
+  RelayRuntime.status = await HostServer.instance.start(
+    accountStore: await createDefaultAccountStore(),
+  );
 }

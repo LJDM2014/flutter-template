@@ -1,3 +1,4 @@
+import '../auth/account_store.dart';
 import 'relay_status.dart';
 
 export 'relay_status.dart';
@@ -11,11 +12,14 @@ class HostServer {
   bool get isRunning => false;
   int? get port => null;
 
-  Future<RelayStatus> start({int port = 9090}) async =>
-      const RelayStatus.unsupported();
+  Future<RelayStatus> start({
+    int port = 9090,
+    required AccountStore accountStore,
+    bool allowRegistration = true,
+  }) async => const RelayStatus.unsupported();
 
   /// 测试钩子的桩实现（Web 端无真实会话，空操作）。
-  Future<void> dropClient(String deviceId) async {}
+  Future<void> dropClient(String userId) async {}
 
   Future<void> stop() async {}
 }

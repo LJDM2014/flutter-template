@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -8,12 +10,17 @@ import '../../core/network/relay_status.dart';
 import '../../core/network/ws_client.dart';
 import '../../core/protocol/message_envelope.dart';
 import '../../shared/app_paths.dart';
+import '../auth/auth_providers.dart';
 import 'connection_providers.dart';
 
-/// 连接页：
-/// - 手动输入服务器地址（host[:port]）并连接/断开；
-/// - 展示本机内置中继服务状态（仅桌面端）与本机局域网地址；
-/// - 连接后实时展示在线设备列表（roster）。
+/// 连接页（连接状态页）：
+/// - 展示当前连接状态（自动连接的进度与失败原因见顶部横幅）；
+/// - 「自动检测并连接」：登录即连接失败后可在此重试自动寻址；
+/// - 手动输入服务器地址（host[:port]）连接/断开；
+/// - 展示本机内置中继服务状态（仅桌面端）与本机局域网地址、在线用户列表。
+///
+/// 阶段⑤起连接由「登录即连接」自动完成，本页不再是必经步骤，
+/// 降级为连接状态查看与手动重试/改址的设置页。
 class ConnectPage extends ConsumerStatefulWidget {
   const ConnectPage({super.key});
 
@@ -32,7 +39,7 @@ class _ConnectPageState extends ConsumerState<ConnectPage> {
     _addressController = TextEditingController(
       text: ':${AppConstants.defaultPort}',
     );
-    _loadLastAddress();
+    unawaited(_loadLastAddress());
   }
 
   Future<void> _loadLastAddress() async {
@@ -83,6 +90,24 @@ class _ConnectPageState extends ConsumerState<ConnectPage> {
             children: <Widget>[
               _ConnectionBanner(state: connection.conn),
               const SizedBox(height: 16),
+              if (connection.autoConnecting)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: Row(
+                    children: <Widget>[
+                      const SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      ),
+                      const SizedBox(width: 8),
+                      Text(
+                        '正在自动检测服务器地址…',
+                        style: theme.textTheme.bodySmall,
+                      ),
+                    ],
+                  ),
+                ),
               Text('服务器地址', style: theme.textTheme.titleSmall),
               const SizedBox(height: 8),
               TextField(
@@ -109,6 +134,16 @@ class _ConnectPageState extends ConsumerState<ConnectPage> {
                       : '连接',
                 ),
               ),
+              const SizedBox(height: 8),
+              OutlinedButton.icon(
+                onPressed: isConnectedish || connection.autoConnecting
+                    ? null
+                    : () => ref
+                          .read(connectionProvider.notifier)
+                          .autoConnect(),
+                icon: const Icon(Icons.radar),
+                label: const Text('自动检测并连接'),
+              ),
               const SizedBox(height: 24),
               _RelayStatusCard(),
               const SizedBox(height: 16),
@@ -116,7 +151,7 @@ class _ConnectPageState extends ConsumerState<ConnectPage> {
               const SizedBox(height: 16),
               _DeviceListSection(
                 devices: connection.devices,
-                myDeviceId: ref.watch(deviceIdProvider).value ?? '',
+                myUserId: ref.watch(authProvider).user?.id ?? '',
               ),
             ],
           ),
@@ -148,6 +183,11 @@ class _ConnectionBanner extends StatelessWidget {
             : '连接断开，${state.retryIn!.inSeconds + 1}s 后重连…',
         theme.colorScheme.tertiary,
         Icons.restart_alt,
+      ),
+      LanConnPhase.authFailed => (
+        state.error ?? '登录已失效，请重新登录',
+        theme.colorScheme.error,
+        Icons.error_outline,
       ),
       LanConnPhase.disconnected when state.error != null => (
         state.error!,
@@ -202,15 +242,47 @@ class _RelayStatusCard extends StatelessWidget {
   }
 }
 
-/// 本机局域网地址展示（Web 端为空态）。
-class _LocalAddressSection extends StatelessWidget {
+/// 本机局域网地址展示（定时自动刷新，网络变化后无需重进页面；Web 端为空态）。
+class _LocalAddressSection extends StatefulWidget {
   const _LocalAddressSection({required this.defaultPort});
 
   final int defaultPort;
 
   @override
+  State<_LocalAddressSection> createState() => _LocalAddressSectionState();
+}
+
+class _LocalAddressSectionState extends State<_LocalAddressSection> {
+  static const _refreshInterval = Duration(seconds: 5);
+  Timer? _timer;
+  List<String>? _addresses;
+
+  @override
+  void initState() {
+    super.initState();
+    _refresh();
+    _timer = Timer.periodic(_refreshInterval, (_) => _refresh());
+  }
+
+  Future<void> _refresh() async {
+    final addresses = await listLanIpv4();
+    if (!mounted) {
+      return;
+    }
+    setState(() => _addresses = addresses);
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final defaultPort = widget.defaultPort;
+    final addresses = _addresses;
     return Card(
       margin: EdgeInsets.zero,
       child: Padding(
@@ -226,39 +298,32 @@ class _LocalAddressSection extends StatelessWidget {
               ],
             ),
             const SizedBox(height: 12),
-            FutureBuilder<List<String>>(
-              future: listLanIpv4(),
-              builder: (context, snapshot) {
-                if (snapshot.connectionState != ConnectionState.done) {
-                  return const Padding(
-                    padding: EdgeInsets.symmetric(vertical: 8),
-                    child: SizedBox(
-                      width: 20,
-                      height: 20,
-                      child: CircularProgressIndicator(strokeWidth: 2),
+            if (addresses == null)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 8),
+                child: SizedBox(
+                  width: 20,
+                  height: 20,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+              )
+            else if (addresses.isEmpty)
+              Text(
+                '未获取到局域网地址（Web 端仅作为客户端，无需展示）',
+                style: theme.textTheme.bodySmall,
+              )
+            else
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: <Widget>[
+                  for (final address in addresses)
+                    Chip(
+                      label: Text('$address:$defaultPort'),
+                      labelStyle: theme.textTheme.bodySmall,
                     ),
-                  );
-                }
-                final addresses = snapshot.data ?? const <String>[];
-                if (addresses.isEmpty) {
-                  return Text(
-                    '未获取到局域网地址（Web 端仅作为客户端，无需展示）',
-                    style: theme.textTheme.bodySmall,
-                  );
-                }
-                return Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: <Widget>[
-                    for (final address in addresses)
-                      Chip(
-                        label: Text('$address:$defaultPort'),
-                        labelStyle: theme.textTheme.bodySmall,
-                      ),
-                  ],
-                );
-              },
-            ),
+                ],
+              ),
           ],
         ),
       ),
@@ -266,12 +331,12 @@ class _LocalAddressSection extends StatelessWidget {
   }
 }
 
-/// 在线设备列表（连接后由 roster 实时刷新）。
+/// 在线用户列表（连接后由 roster 实时刷新，按账号身份去重）。
 class _DeviceListSection extends StatelessWidget {
-  const _DeviceListSection({required this.devices, required this.myDeviceId});
+  const _DeviceListSection({required this.devices, required this.myUserId});
 
-  final List<DeviceProfile> devices;
-  final String myDeviceId;
+  final List<UserProfile> devices;
+  final String myUserId;
 
   @override
   Widget build(BuildContext context) {
@@ -292,7 +357,7 @@ class _DeviceListSection extends StatelessWidget {
                 ),
                 const SizedBox(width: 8),
                 Text(
-                  '在线设备 (${devices.length})',
+                  '在线用户 (${devices.length})',
                   style: theme.textTheme.titleSmall,
                 ),
               ],
@@ -300,7 +365,7 @@ class _DeviceListSection extends StatelessWidget {
             const SizedBox(height: 8),
             if (devices.isEmpty)
               Text(
-                myDeviceId.isEmpty ? '连接后此处展示局域网内的在线设备' : '尚未连接，或局域网内暂无其他设备',
+                myUserId.isEmpty ? '登录后连接中继即可查看在线用户' : '尚未连接，或局域网内暂无其他用户',
                 style: theme.textTheme.bodySmall,
               )
             else
@@ -310,13 +375,19 @@ class _DeviceListSection extends StatelessWidget {
                     ListTile(
                       dense: true,
                       contentPadding: EdgeInsets.zero,
-                      leading: const Icon(Icons.devices_other),
+                      leading: const Icon(Icons.person_outline),
                       title: Text(
                         device.nickname.isEmpty
-                            ? '设备 ${device.id.substring(0, 8)}'
+                            ? '用户 ${device.id.substring(0, 8)}'
                             : device.nickname,
                       ),
-                      trailing: device.id == myDeviceId
+                      subtitle: device.username.isEmpty
+                          ? null
+                          : Text(
+                              '@${device.username}',
+                              style: theme.textTheme.bodySmall,
+                            ),
+                      trailing: device.id == myUserId
                           ? const Chip(
                               label: Text('本机'),
                               visualDensity: VisualDensity.compact,
