@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:flutter_template/core/auth/account_store_io.dart';
 import 'package:flutter_template/core/network/host_server.dart';
+import 'package:flutter_template/core/network/probe_result.dart';
 import 'package:flutter_template/core/network/server_probe_io.dart';
 import 'package:flutter_template/core/network/server_resolver.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -72,7 +73,9 @@ void main() {
               Duration timeout = const Duration(milliseconds: 800),
             }) async {
               calls.add('$host:$port');
-              return reachable.contains(host);
+              return reachable.contains(host)
+                  ? const ProbeResult(reachable: true, secure: false)
+                  : ProbeResult.unreachable;
             },
         listLocalAddresses: () async => localIps,
       );
@@ -155,6 +158,24 @@ void main() {
       );
       expect(resolved?.port, 8080);
       expect(calls.first, '10.0.0.5:8080');
+    });
+
+    test('TLS 服务探测结果携带 secure 标记', () async {
+      final resolver = ServerAddressResolver(
+        probe:
+            (
+              host,
+              port, {
+              Duration timeout = const Duration(milliseconds: 800),
+            }) async => const ProbeResult(reachable: true, secure: true),
+        listLocalAddresses: () async => [],
+      );
+      final resolved = await resolver.resolve(
+        savedAddress: '10.0.0.6',
+        fallbackPort: 9090,
+      );
+      expect(resolved?.host, '10.0.0.6');
+      expect(resolved?.secure, isTrue);
     });
   });
 

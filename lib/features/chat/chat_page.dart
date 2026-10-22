@@ -175,7 +175,9 @@ class _EmptyState extends ConsumerWidget {
       return _CenterHint(
         icon: Icons.restart_alt,
         spin: true,
-        text: conn.retryIn == null
+        text: conn.slowPolling
+            ? '连接中断，每 60s 自动重连，恢复后无需手动操作'
+            : conn.retryIn == null
             ? '连接断开，正在重连…'
             : '连接断开，${conn.retryIn!.inSeconds + 1}s 后重连…',
       );

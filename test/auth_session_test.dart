@@ -6,8 +6,10 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'package:flutter_template/core/auth/token_store.dart';
 import 'package:flutter_template/core/constants.dart';
 import 'package:flutter_template/core/network/host_server_io.dart';
+import 'package:flutter_template/core/network/probe_result.dart';
 import 'package:flutter_template/core/network/server_resolver.dart';
 import 'package:flutter_template/core/network/ws_client.dart';
 import 'package:flutter_template/features/auth/auth_providers.dart';
@@ -21,6 +23,9 @@ import 'server_test_kit.dart';
 /// 3. 服务器不可达时乐观恢复；
 /// 4. 恢复会话后自动解析地址并连接真实中继（登录即连接）；
 /// 5. 自动连接失败时给出明确错误提示。
+///
+/// R4 起 token 存于安全存储（测试以 InMemoryTokenStore 覆写），
+/// shared_preferences 只保存非敏感的账号资料。
 
 /// /api/me 桩服务：按给定状态码与响应体应答。
 Future<HttpServer> _startMeStub({
@@ -47,24 +52,42 @@ class _NoServerResolver extends ServerAddressResolver {
               String _,
               int _, {
               Duration timeout = const Duration(milliseconds: 800),
-            }) async => false,
+            }) async => ProbeResult.unreachable,
         listLocalAddresses: () async => <String>[],
       );
 }
 
-Map<String, Object> _sessionPrefs({
+/// 创建带预置会话的容器：token 写入内存安全存储、资料写入 mock prefs。
+/// 返回容器与 token 存储实例供断言；可选注入桩解析器。
+Future<(ProviderContainer, InMemoryTokenStore)> _sessionContainer({
   required String token,
   required String userId,
   String username = 'saved_user',
   String nickname = '本地昵称',
   required String serverHost,
-}) => <String, Object>{
-  AppConstants.prefKeyAuthToken: token,
-  AppConstants.prefKeyAuthUserId: userId,
-  AppConstants.prefKeyAuthUsername: username,
-  AppConstants.prefKeyAuthNickname: nickname,
-  AppConstants.prefKeyServerHost: serverHost,
-};
+  ServerAddressResolver? resolver,
+}) async {
+  final tokenStore = InMemoryTokenStore();
+  if (token.isNotEmpty) {
+    await tokenStore.writeToken(token);
+  }
+  SharedPreferences.setMockInitialValues(<String, Object>{
+    AppConstants.prefKeyAuthUserId: userId,
+    AppConstants.prefKeyAuthUsername: username,
+    AppConstants.prefKeyAuthNickname: nickname,
+    AppConstants.prefKeyServerHost: serverHost,
+  });
+  final container = ProviderContainer(
+    overrides: [
+      tokenStoreProvider.overrideWithValue(tokenStore),
+      if (resolver != null)
+        connectionProvider.overrideWith(
+          () => ConnectionController(resolver: resolver),
+        ),
+    ],
+  );
+  return (container, tokenStore);
+}
 
 void main() {
   tearDown(() async {
@@ -78,14 +101,11 @@ void main() {
         'error': <String, dynamic>{'code': 'INVALID_TOKEN', 'message': '凭证无效'},
       },
     );
-    SharedPreferences.setMockInitialValues(
-      _sessionPrefs(
-        token: 'dead-token',
-        userId: 'user-1',
-        serverHost: '127.0.0.1:${stub.port}',
-      ),
+    final (container, tokenStore) = await _sessionContainer(
+      token: 'dead-token',
+      userId: 'user-1',
+      serverHost: '127.0.0.1:${stub.port}',
     );
-    final container = ProviderContainer();
     addTearDown(container.dispose);
 
     await waitFor(
@@ -93,9 +113,9 @@ void main() {
       what: '无效 token 恢复后转未登录',
     );
 
-    // 本地会话已被清空，下次启动直接进登录页。
+    // 本地会话已被清空（含安全存储中的 token），下次启动直接进登录页。
+    expect(await tokenStore.readToken(), isNull);
     final prefs = await SharedPreferences.getInstance();
-    expect(prefs.getString(AppConstants.prefKeyAuthToken), isNull);
     expect(prefs.getString(AppConstants.prefKeyAuthUserId), isNull);
     stub.close(force: true);
   });
@@ -111,14 +131,11 @@ void main() {
         },
       },
     );
-    SharedPreferences.setMockInitialValues(
-      _sessionPrefs(
-        token: 'good-token',
-        userId: 'user-1',
-        serverHost: '127.0.0.1:${stub.port}',
-      ),
+    final (container, _) = await _sessionContainer(
+      token: 'good-token',
+      userId: 'user-1',
+      serverHost: '127.0.0.1:${stub.port}',
     );
-    final container = ProviderContainer();
     addTearDown(container.dispose);
 
     await waitFor(
@@ -134,22 +151,19 @@ void main() {
 
   test('服务器不可达：乐观恢复已登录（由连接层兜底重试）', () async {
     // 127.0.0.1:1 无监听，连接立即被拒 → NETWORK_ERROR（非 INVALID_TOKEN）。
-    SharedPreferences.setMockInitialValues(
-      _sessionPrefs(
-        token: 'token-xyz',
-        userId: 'user-1',
-        serverHost: '127.0.0.1:1',
-      ),
+    final (container, tokenStore) = await _sessionContainer(
+      token: 'token-xyz',
+      userId: 'user-1',
+      serverHost: '127.0.0.1:1',
     );
-    final container = ProviderContainer();
     addTearDown(container.dispose);
 
     await waitFor(
       () => container.read(authProvider).isAuthenticated,
       what: '服务器不可达时仍乐观恢复会话',
     );
-    final prefs = await SharedPreferences.getInstance();
-    expect(prefs.getString(AppConstants.prefKeyAuthToken), 'token-xyz');
+    // 乐观恢复不清会话：token 仍在安全存储中。
+    expect(await tokenStore.readToken(), 'token-xyz');
   });
 
   test('登录即连接：恢复会话后自动连接真实中继并收到 roster', () async {
@@ -164,17 +178,13 @@ void main() {
 
     // 注册账号并写入本地会话（模拟上次登录留存的 token）。
     final account = await registerAccount(port, 'auto_user', deviceId: 'dev-1');
-    SharedPreferences.setMockInitialValues(<String, Object>{
-      ..._sessionPrefs(
-        token: account.token,
-        userId: account.userId,
-        username: account.username,
-        nickname: account.nickname,
-        serverHost: '127.0.0.1:$port',
-      ),
-    });
-
-    final container = ProviderContainer();
+    final (container, _) = await _sessionContainer(
+      token: account.token,
+      userId: account.userId,
+      username: account.username,
+      nickname: account.nickname,
+      serverHost: '127.0.0.1:$port',
+    );
     addTearDown(container.dispose);
 
     // 先读连接状态（创建控制器并监听认证变化），恢复完成后应自动连接。
@@ -192,8 +202,14 @@ void main() {
     );
 
     // roster 到位：在线列表包含自己（按用户身份）。
-    final devices = container.read(connectionProvider).devices;
-    expect(devices.any((d) => d.id == account.userId), isTrue);
+    // connected 观察到 roster 帧处理之间存在事件循环竞争，需轮询等待。
+    await waitFor(
+      () => container
+          .read(connectionProvider)
+          .devices
+          .any((d) => d.id == account.userId),
+      what: 'roster 包含自己',
+    );
 
     // 解析出的地址已持久化为上次使用的地址。
     final prefs = await SharedPreferences.getInstance();
@@ -201,19 +217,11 @@ void main() {
   });
 
   test('自动连接失败：无可连通服务器时连接状态给出错误提示', () async {
-    SharedPreferences.setMockInitialValues(
-      _sessionPrefs(
-        token: 'token-xyz',
-        userId: 'user-1',
-        serverHost: '127.0.0.1:1',
-      ),
-    );
-    final container = ProviderContainer(
-      overrides: [
-        connectionProvider.overrideWith(
-          () => ConnectionController(resolver: _NoServerResolver()),
-        ),
-      ],
+    final (container, _) = await _sessionContainer(
+      token: 'token-xyz',
+      userId: 'user-1',
+      serverHost: '127.0.0.1:1',
+      resolver: _NoServerResolver(),
     );
     addTearDown(container.dispose);
 

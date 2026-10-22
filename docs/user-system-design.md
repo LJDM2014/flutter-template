@@ -282,4 +282,38 @@ auth/
 
 > 2026-10-21 进展：analyze 0 告警、98 项测试全绿；三端构建产物已产出——Web `build/web`、Windows `build/windows/x64/runner/Release/flutter_template.exe`、Android `build/app/outputs/flutter-apk/app-release.apk`（51.2MB，release 用 debug 签名）。构建注意：沙箱环境会拦截 Gradle 对 pub 缓存中 `jni` 插件 `.cxx` 目录与 Android SDK `.knownPackages` 的写入，需在沙箱外执行 `flutter build apk`。真机双端互发 + 离线补投验证待人工执行。
 
+### 阶段 R1/R2：安全加固（架构风险报告 P0 项）
+
+> 2026-10-22 完成：
+>
+> **R2 PBKDF2 阻塞**：`PasswordHasher.hash/verify` 改为 `Isolate.run` 后台执行（返回 Future），10 万次迭代不再阻塞事件循环（服务端并发登录/注册时 WS 心跳与转发不受影响）；`AccountStore.register/verifyLogin/changePassword` 调用点与相关测试同步适配 await，`deriveHex`（RFC 向量）保持同步。
+>
+> **R1 明文传输（WSS/HTTPS + 自签证书 + 客户端自动回退）**：
+> - 新增 `core/network/relay_cert.dart`（pointycastle）：首次启动生成 RSA-2048 自签证书（CN=LAN Messenger Relay，有效期 10 年，随机序列号，basicConstraints CA:true；TBS/SPKI/PKCS#8 全部 DER 手工拼装），`relay-cert.pem` / `relay-key.pem` 以「临时文件 + rename」原子落盘于应用数据目录，幂等复用；
+> - `HostServer.start` 新增可选 `SecurityContext`（shelf_io 以 TLS 监听）；桌面启动装配证书上下文，生成/加载失败降级为明文（可用性优先）；`RelayStatus` 增加 `secure` 标记，连接页展示 TLS 状态；
+> - 服务探测改为**先 TLS 后明文**（`probeServer` → `ProbeResult{reachable, secure}`，防止把 TLS 服务误判为明文可达）：IO 用 `SecureSocket.connect`（onBadCertificate 接受自签），Web 用 fetch `/api/me` 近似探测（https 优先，任何响应含 401 均算可达）；
+> - `ResolvedServer` 增加 `secure`；持久化新增 `pref.server_secure`；WS 连接与 autoConnect 按标记选 wss/ws，REST（register/login/me/nickname/password）按 secure 选 https/http，https 使用接受自签证书的 `IOClient`；
+> - `LanWsClient` 默认连接器经 `tls_support.dart` 条件导入：IO 端 wss 用 `IOWebSocketChannel.connect(customClient:)`（badCertificateCallback 接受自签），Web 端证书信任由浏览器策略管理，无法代码内绕过（连接页提示：Web 首次使用需先用浏览器访问一次中继地址并信任证书）；
+> - 新增 `test/relay_tls_test.dart` 5 项：证书生成幂等且 PEM 可被 SecurityContext 加载、TLS 端口 secure 探测命中、https REST 注册/登录/me 闭环、wss 生产连接器双端握手 + roster 闭环、明文服务探测 secure=false 不误判。
+>
+> 全量：analyze 0 告警，104 项测试全绿。经验：条件导出门面在分析器下可能解析到 stub，io-only 文件（desktop_bootstrap_io）直接导入具体实现；auth_session_test 的 roster 断言存在事件循环竞争（connected 状态观察与 roster 帧处理间无顺序保证），改为 waitFor 轮询。
+
+### 阶段 R3/R4：可靠性与令牌安全（架构风险报告 P1 项）
+
+> 2026-10-22 完成：
+>
+> **R3 重连永不放弃**：
+> - `LanWsClient` 退避耗尽（`BackoffStrategy.delayFor` 返回 null）不再进入 `disconnected` 终态，改转 `slowPollInterval`（60s）慢速轮询：保持 `reconnecting` 阶段、按周期重试建连，中继恢复后客户端在下一轮询周期内自动自愈；
+> - `LanConnState` 新增 `slowPolling` 标记，连接页/消息页空态区分文案：「连接断开，Xs 后重连…」（快速退避）vs「连接中断，每 60s 自动重连，恢复后无需手动操作」（慢速轮询）；
+> - 聊天层语义适配：慢速轮询期间消息保持「发送中」等待补发（不标记失败）；`ChatController._onConnState` 改为仅在客户端进入 `disconnected`（主动断开、实例替换）时把发送中消息标记为失败，用户可点击重试；
+> - `chat_flow_test` 阶段⑦改写：退避耗尽 → 慢速轮询且消息保持发送中 → 实例替换标记失败 → retryMessage 重新入队 → 恢复连接后补发并转已送达。
+>
+> **R4 token 摘要落盘 + 客户端安全存储**：
+> - 服务端：`sessions.json` 只存 `SHA-256(token)` 摘要（键与 `AuthSession.token` 均为摘要），校验时对来方明文 token 做同样摘要后比对；`verifyLogin` 返回值是唯一携带明文 token 的会话（下发给客户端仅此一次）；离线补投、多设备踢出、改密吊销均按摘要键控，行为不变。注意：升级后旧版明文 sessions.json 条目（摘要与明文同为 64 位 hex、无法区分）将校验失败，存量用户需重新登录一次；
+> - 客户端：新增 `core/auth/token_store.dart` 条件门面 + `token_store_base.dart`（`TokenStore` 接口与 `InMemoryTokenStore` 测试实现）+ `token_store_secure.dart`（IO：flutter_secure_storage，Windows DPAPI / Android Keystore，首次读取自动迁移旧版 shared_preferences 明文副本并删除）+ `token_store_prefs.dart`（Web：localStorage，键名沿用、存量会话免迁移）；账号资料（user_id/username/nickname，非敏感）仍存 shared_preferences；
+> - `auth_providers` 经 `tokenStoreProvider`（可覆写）读写 token：`_restore` 读取（平台通道异常按无会话处理）、`_applySession` 写入、`_clearSession` 删除；
+> - 测试适配：`account_store_test` 增加「sessions.json 不含明文 token、含摘要」断言；`auth_session_test` / `app_test` 以 `InMemoryTokenStore` 覆写注入（FakeAsync 下 secure_storage 平台通道永不完成，必须覆写）。
+>
+> 全量：analyze 0 告警，105 项测试全绿。
+
 实施顺序：⑤ → ⑥ 优先（对应「登录即连接」「离线提示」两个核心诉求），⑦ 可与 ⑥ 同批实施（同在 chat 层）。

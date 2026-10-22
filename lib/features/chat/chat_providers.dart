@@ -15,8 +15,9 @@ const String kBroadcastConversation = 'broadcast';
 
 /// 单条消息的发送状态。
 ///
-/// [ChatSendStatus.failed] 为终态：重连放弃（重试上限）后标记，
-/// 用户点击重试后置回「发送中」并重新入待发队列。
+/// [ChatSendStatus.failed] 为终态：客户端实例被替换或主动断开后标记，
+/// 用户点击重试后置回「发送中」并重新入待发队列。慢速轮询（R3）期间
+/// 不进入终态，消息保持「发送中」等待重连补发。
 enum ChatSendStatus { sending, sent, failed }
 
 /// 一条聊天消息（本地展示与持久化模型）。
@@ -295,10 +296,13 @@ class ChatController extends Notifier<ChatUiState> {
     _connSub = null;
   }
 
-  /// 连接放弃（重连上限，disconnected 且带错误）时，把仍在「发送中」的
-  /// 消息标记为失败，等待用户点击重试。
+  /// 客户端进入 disconnected（主动断开、实例清理）时，把仍在「发送中」
+  /// 的消息标记为失败，等待用户点击重试。
+  ///
+  /// R3 起退避耗尽转慢速轮询、不再进入 disconnected 终态，因此断线期间
+  /// 消息保持「发送中」，重连后自动补发转「已送达」。
   void _onConnState(LanConnState conn) {
-    if (conn.phase == LanConnPhase.disconnected && conn.error != null) {
+    if (conn.phase == LanConnPhase.disconnected) {
       _markAllFailed();
     }
   }

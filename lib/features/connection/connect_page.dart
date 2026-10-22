@@ -101,10 +101,7 @@ class _ConnectPageState extends ConsumerState<ConnectPage> {
                         child: CircularProgressIndicator(strokeWidth: 2),
                       ),
                       const SizedBox(width: 8),
-                      Text(
-                        '正在自动检测服务器地址…',
-                        style: theme.textTheme.bodySmall,
-                      ),
+                      Text('正在自动检测服务器地址…', style: theme.textTheme.bodySmall),
                     ],
                   ),
                 ),
@@ -135,12 +132,17 @@ class _ConnectPageState extends ConsumerState<ConnectPage> {
                 ),
               ),
               const SizedBox(height: 8),
+              Text(
+                '连接默认优先 TLS 加密（wss/https，自签证书）。'
+                'Web 端首次使用需先用浏览器访问一次中继地址'
+                '（如 https://192.168.1.100:9090）并信任证书。',
+                style: theme.textTheme.bodySmall,
+              ),
+              const SizedBox(height: 8),
               OutlinedButton.icon(
                 onPressed: isConnectedish || connection.autoConnecting
                     ? null
-                    : () => ref
-                          .read(connectionProvider.notifier)
-                          .autoConnect(),
+                    : () => ref.read(connectionProvider.notifier).autoConnect(),
                 icon: const Icon(Icons.radar),
                 label: const Text('自动检测并连接'),
               ),
@@ -178,7 +180,9 @@ class _ConnectionBanner extends StatelessWidget {
         Icons.sync,
       ),
       LanConnPhase.reconnecting => (
-        state.retryIn == null
+        state.slowPolling
+            ? '连接中断，每 60s 自动重连，恢复后无需手动操作'
+            : state.retryIn == null
             ? '连接断开，正在重连…'
             : '连接断开，${state.retryIn!.inSeconds + 1}s 后重连…',
         theme.colorScheme.tertiary,
@@ -232,10 +236,16 @@ class _RelayStatusCard extends StatelessWidget {
       child: ListTile(
         leading: Icon(Icons.dns, color: theme.colorScheme.primary),
         title: Text(
-          '本机中继服务运行中 · :${status.port}',
+          status.secure
+              ? '本机中继服务运行中 · :${status.port}（TLS 加密）'
+              : '本机中继服务运行中 · :${status.port}（明文）',
           style: theme.textTheme.titleSmall,
         ),
-        subtitle: const Text('局域网内其他设备连接本机地址即可互通'),
+        subtitle: Text(
+          status.secure
+              ? '已启用 TLS（自签证书）；Web 端首次连接需在浏览器信任证书'
+              : '局域网内其他设备连接本机地址即可互通',
+        ),
         dense: true,
       ),
     );

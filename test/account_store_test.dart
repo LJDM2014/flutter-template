@@ -1,8 +1,11 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_template/core/auth/account_store.dart';
 import 'package:flutter_template/core/auth/account_store_io.dart';
 import 'package:flutter_test/flutter_test.dart';
+
+import 'package:crypto/crypto.dart';
 
 void main() {
   late Directory tempDir;
@@ -153,7 +156,11 @@ void main() {
         userId: session.userId,
       );
       expect(validated, isNotNull);
-      expect(validated!.token, session.token);
+      // 库内记录存的是摘要：validateToken 返回的会话携带 SHA-256(token)。
+      expect(
+        validated!.token,
+        sha256.convert(utf8.encode(session.token)).toString(),
+      );
     });
 
     test('userId 不匹配返回 null', () async {
@@ -307,6 +314,31 @@ void main() {
       final offline = await reopened.takeOffline(userId: 'u1');
       expect(offline, hasLength(1));
       expect(offline.first.text, 'hi');
+    });
+
+    test('sessions.json 只存 token 摘要，明文不落盘（R4）', () async {
+      await store.register(username: 'alice', password: 'password1');
+      final session = await store.verifyLogin(
+        username: 'alice',
+        password: 'password1',
+        deviceId: 'dev-1',
+      );
+      final raw = await File('${tempDir.path}/sessions.json').readAsString();
+      expect(
+        raw.contains(session.token),
+        isFalse,
+        reason: '明文 token 不得写入 sessions.json',
+      );
+      expect(
+        raw.contains(sha256.convert(utf8.encode(session.token)).toString()),
+        isTrue,
+        reason: 'sessions.json 应包含 SHA-256(token) 摘要',
+      );
+      // 摘要存储不影响校验：明文 token 仍可通过 validateToken。
+      expect(
+        await store.validateToken(token: session.token, userId: session.userId),
+        isNotNull,
+      );
     });
 
     test('损坏的 JSON 文件按空库处理，不阻断新写入', () async {

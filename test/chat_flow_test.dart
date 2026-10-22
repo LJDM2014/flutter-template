@@ -328,9 +328,9 @@ void main() {
     await clientS.disconnect();
   });
 
-  test('阶段⑦ 重连上限：发送中标记失败，重试后重新入队', () async {
+  test('阶段⑦ 重连上限：转慢速轮询不放弃，实例替换可重试，恢复后补发', () async {
     final accountG = await registerAccount(port, 'flow_g', nickname: '庚');
-    // 指向不可达地址；退避极短且限制 1 次重试，快速触发「连接放弃」。
+    // 指向不可达地址；退避极短且限制 1 次重试，快速耗尽退避转入慢速轮询。
     final clientG = LanWsClient(
       userId: accountG.userId,
       deviceId: 'device-flow_g',
@@ -358,15 +358,49 @@ void main() {
     containerG.read(chatProvider);
 
     await clientG.connect(Uri.parse('ws://127.0.0.1:1/ws'));
-    expect(containerG.read(chatProvider.notifier).send('必败消息'), isTrue);
+    expect(containerG.read(chatProvider.notifier).send('排队消息'), isTrue);
 
+    // R3：退避耗尽后进入慢速轮询（不再进入 disconnected 终态），
+    // 消息保持「发送中」等待补发，不标记失败。
+    await waitFor(
+      () =>
+          clientG.state.phase == LanConnPhase.reconnecting &&
+          clientG.state.slowPolling,
+      what: '退避耗尽转入慢速轮询',
+    );
+    final queued = chatStateOf(
+      containerG,
+    ).messagesOf(kBroadcastConversation).last;
+    expect(queued.text, '排队消息');
+    expect(
+      queued.status,
+      ChatSendStatus.sending,
+      reason: '慢速轮询期间消息保持发送中等待补发',
+    );
+    expect(clientG.hasPending(queued.msgId), isTrue);
+
+    // 客户端实例被替换（如重新登录）：旧实例待发消息转失败，用户可重试。
+    final clientG2 = LanWsClient(
+      userId: accountG.userId,
+      deviceId: 'device-flow_g',
+      nickname: '庚',
+      token: accountG.token,
+      backoff: BackoffStrategy(
+        baseDelay: const Duration(milliseconds: 1),
+        maxDelay: const Duration(milliseconds: 2),
+        jitterRatio: 0,
+        maxAttempts: 1,
+      ),
+      heartbeatInterval: Duration.zero,
+    );
+    containerG.read(wsClientProvider.notifier).attach(clientG2);
     await waitFor(
       () =>
           chatStateOf(
             containerG,
           ).messagesOf(kBroadcastConversation).last.status ==
           ChatSendStatus.failed,
-      what: '连接放弃后发送中消息标记为失败',
+      what: '实例替换后发送中消息标记为失败',
     );
 
     // 重试：置回「发送中」并重新入队（此时仍未连接，等待补发）。
@@ -380,8 +414,21 @@ void main() {
       chatStateOf(containerG).messagesOf(kBroadcastConversation).last.status,
       ChatSendStatus.sending,
     );
-    expect(clientG.hasPending(msgId), isTrue, reason: '重试后重新入待发队列');
+    expect(clientG2.hasPending(msgId), isTrue, reason: '重试后重新入待发队列');
+
+    // 中继恢复（连接真实地址）：重试消息补发并被 ack 转已送达。
+    await clientG2.connect(Uri.parse('ws://127.0.0.1:$port/ws'));
+    await waitFor(
+      () =>
+          chatStateOf(
+            containerG,
+          ).messagesOf(kBroadcastConversation).last.status ==
+          ChatSendStatus.sent,
+      what: '恢复连接后消息补发并转已送达',
+    );
+    expect(clientG2.pendingCount, 0, reason: '补发成功后待发队列清空');
 
     await clientG.disconnect();
+    await clientG2.disconnect();
   });
 }

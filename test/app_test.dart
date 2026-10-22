@@ -3,8 +3,11 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:flutter_template/app.dart';
+import 'package:flutter_template/core/auth/token_store.dart';
 import 'package:flutter_template/core/constants.dart';
+import 'package:flutter_template/core/network/probe_result.dart';
 import 'package:flutter_template/core/network/server_resolver.dart';
+import 'package:flutter_template/features/auth/auth_providers.dart';
 import 'package:flutter_template/features/connection/connection_providers.dart';
 
 /// 永远探测不到服务器的解析器：让「登录即连接」在测试中确定性失败，
@@ -17,7 +20,7 @@ class _NoServerResolver extends ServerAddressResolver {
               String _,
               int _, {
               Duration timeout = const Duration(milliseconds: 800),
-            }) async => false,
+            }) async => ProbeResult.unreachable,
         listLocalAddresses: () async => <String>[],
       );
 }
@@ -25,7 +28,14 @@ class _NoServerResolver extends ServerAddressResolver {
 void main() {
   testWidgets('未登录时启动进入登录页', (tester) async {
     SharedPreferences.setMockInitialValues(<String, Object>{});
-    await tester.pumpWidget(const ProviderScope(child: LanMessengerApp()));
+    // 空的内存 token 存储：模拟「无已存会话」，避免 FakeAsync 环境下
+    // secure_storage 平台通道永不完成导致认证恢复卡住。
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [tokenStoreProvider.overrideWithValue(InMemoryTokenStore())],
+        child: const LanMessengerApp(),
+      ),
+    );
     // 不使用 pumpAndSettle：认证恢复与页面内容包含真实异步初始化，
     // 在 FakeAsync 环境中可能永不完成，分步 pump 即可。
     await tester.pump();
@@ -38,8 +48,10 @@ void main() {
   });
 
   testWidgets('已保存会话时启动直达消息页并自动连接（失败时给出提示）', (tester) async {
+    // R4：token 存于安全存储（测试以内存实现预置），prefs 只保存账号资料。
+    final tokenStore = InMemoryTokenStore();
+    await tokenStore.writeToken('token-abc');
     SharedPreferences.setMockInitialValues(<String, Object>{
-      AppConstants.prefKeyAuthToken: 'token-abc',
       AppConstants.prefKeyAuthUserId: 'user-1',
       AppConstants.prefKeyAuthUsername: 'saved_user',
       AppConstants.prefKeyAuthNickname: '存档',
@@ -47,6 +59,7 @@ void main() {
     await tester.pumpWidget(
       ProviderScope(
         overrides: [
+          tokenStoreProvider.overrideWithValue(tokenStore),
           // 桩解析器：自动连接确定性失败，断言失败提示而非真实网络。
           connectionProvider.overrideWith(
             () => ConnectionController(resolver: _NoServerResolver()),

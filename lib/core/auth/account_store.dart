@@ -59,6 +59,9 @@ class AccountUser {
 }
 
 /// 一次登录会话（token 凭证）。
+///
+/// R4 起存储层只持久化 [token] 的 SHA-256 摘要；[AccountStore.verifyLogin]
+/// 的返回值是唯一携带明文 token 的会话对象（下发给客户端，仅此一次）。
 class AuthSession {
   const AuthSession({
     required this.token,
@@ -149,6 +152,8 @@ abstract class AccountStore {
   /// 校验用户名 + 密码，签发会话 token。
   ///
   /// 凭据错误（含用户不存在）统一抛 BAD_CREDENTIALS，避免用户名枚举。
+  /// 返回会话的 [AuthSession.token] 为明文 token（仅此一次）；存储层只
+  /// 持久化其 SHA-256 摘要，后续校验传入明文 token 由实现摘要比对。
   Future<AuthSession> verifyLogin({
     required String username,
     required String password,

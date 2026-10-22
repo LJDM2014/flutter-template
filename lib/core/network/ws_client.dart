@@ -4,6 +4,7 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../protocol/message_envelope.dart';
 import 'backoff.dart';
+import 'tls_support.dart';
 
 /// 连接阶段。
 ///
@@ -24,6 +25,7 @@ class LanConnState {
     this.address,
     this.retryIn,
     this.error,
+    this.slowPolling = false,
   });
 
   final LanConnPhase phase;
@@ -33,15 +35,22 @@ class LanConnState {
   final Duration? retryIn;
   final String? error;
 
+  /// 退避耗尽后的慢速轮询（R3）：连接不再进入 disconnected 终态，
+  /// 改为按 [LanWsClient.slowPollInterval] 低频重试保持自愈能力；
+  /// UI 据此区分「快速退避重连」与「慢速重连」文案。
+  final bool slowPolling;
+
   @override
   String toString() =>
-      'LanConnState(${phase.name}, retryIn=$retryIn, error=$error)';
+      'LanConnState(${phase.name}, retryIn=$retryIn, '
+      'slowPolling=$slowPolling, error=$error)';
 }
 
 /// 局域网 WebSocket 客户端（纯 Dart，无 Flutter 依赖，可被单元/集成测试）。
 ///
 /// 职责：
 /// - 建立连接并在断开后按指数退避自动重连（[BackoffStrategy]）；
+///   退避耗尽后不放弃，转 [slowPollInterval] 慢速轮询保持自动恢复（R3）；
 /// - 心跳保活：定期 ping，连续超时未收到 pong 主动断开触发重连；
 /// - 可靠性：携带 msgId 且未收到 ack 的消息保留在待发队列，重连成功后补发。
 ///
@@ -57,7 +66,8 @@ class LanWsClient {
     this.heartbeatInterval = const Duration(seconds: 15),
     FutureOr<WebSocketChannel> Function(Uri uri)? connector,
   }) : _backoff = backoff ?? BackoffStrategy(),
-       _connector = connector ?? WebSocketChannel.connect;
+       // connectWs：wss 时接受自签证书（IO 平台）；测试可注入自定义连接器。
+       _connector = connector ?? connectWs;
 
   /// 登录账号 id（阶段②起服务端据此校验 token；匿名直连将被拒绝）。
   final String userId;
@@ -72,6 +82,10 @@ class LanWsClient {
 
   final BackoffStrategy _backoff;
   final FutureOr<WebSocketChannel> Function(Uri uri) _connector;
+
+  /// 退避耗尽后的慢速轮询间隔（R3）：每该时长重试一次建连，
+  /// 保持「重连中」状态，中继恢复后客户端可在下一周期内自愈。
+  static const Duration slowPollInterval = Duration(seconds: 60);
 
   final StreamController<LanConnState> _stateController =
       StreamController<LanConnState>.broadcast();
@@ -200,28 +214,22 @@ class LanWsClient {
       if (!_running || generation != _generation) {
         break;
       }
+      // 退避耗尽（delay == null）不进入 disconnected 终态：转慢速轮询
+      // 保持「重连中」，中继恢复后自动自愈（R3）。
       final delay = _backoff.delayFor(attempt);
-      if (delay == null) {
-        lastError = lastError.isEmpty ? '重连次数已达上限' : lastError;
-        _setState(
-          LanConnState(
-            phase: LanConnPhase.disconnected,
-            address: _uri?.toString(),
-            error: lastError,
-          ),
-        );
-        break;
-      }
+      final exhausted = delay == null;
+      final wait = exhausted ? slowPollInterval : delay;
       attempt += 1;
       _setState(
         LanConnState(
           phase: LanConnPhase.reconnecting,
           address: _uri?.toString(),
-          retryIn: delay,
+          retryIn: wait,
+          slowPolling: exhausted,
           error: lastError.isEmpty ? null : lastError,
         ),
       );
-      await Future<void>.delayed(delay);
+      await Future<void>.delayed(wait);
       if (!_running || generation != _generation) {
         break;
       }

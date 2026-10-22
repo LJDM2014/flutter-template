@@ -12,6 +12,7 @@ class HostServer {
   bool get isRunning => false;
   int? get port => null;
 
+  /// Web 端不支持启动服务（TLS 上下文参数仅 IO 实现提供）。
   Future<RelayStatus> start({
     int port = 9090,
     required AccountStore accountStore,

@@ -45,34 +45,43 @@ void main() {
   });
 
   group('hash / verify', () {
-    test('同盐同密码哈希一致且 verify 通过', () {
+    test('同盐同密码哈希一致且 verify 通过', () async {
       const salt = '0123456789abcdef0123456789abcdef';
-      final h1 = PasswordHasher.hash('correct horse', salt, iterations: 100);
-      final h2 = PasswordHasher.hash('correct horse', salt, iterations: 100);
+      final h1 = await PasswordHasher.hash('correct horse', salt, iterations: 100);
+      final h2 = await PasswordHasher.hash('correct horse', salt, iterations: 100);
       expect(h1, h2);
       expect(h1.length, 64); // 32 字节 hex
       expect(
-        PasswordHasher.verify('correct horse', salt, h1, iterations: 100),
+        await PasswordHasher.verify('correct horse', salt, h1, iterations: 100),
         isTrue,
       );
     });
 
-    test('不同盐产生不同哈希', () {
-      final h1 = PasswordHasher.hash('pw123456', 'aaaa', iterations: 100);
-      final h2 = PasswordHasher.hash('pw123456', 'bbbb', iterations: 100);
+    test('不同盐产生不同哈希', () async {
+      final h1 = await PasswordHasher.hash('pw123456', 'aaaa', iterations: 100);
+      final h2 = await PasswordHasher.hash('pw123456', 'bbbb', iterations: 100);
       expect(h1, isNot(h2));
     });
 
-    test('密码错误 verify 失败', () {
+    test('密码错误 verify 失败', () async {
       const salt = '0123456789abcdef0123456789abcdef';
-      final hash = PasswordHasher.hash('right-password', salt, iterations: 100);
+      final hash = await PasswordHasher.hash(
+        'right-password',
+        salt,
+        iterations: 100,
+      );
       expect(
-        PasswordHasher.verify('wrong-password', salt, hash, iterations: 100),
+        await PasswordHasher.verify(
+          'wrong-password',
+          salt,
+          hash,
+          iterations: 100,
+        ),
         isFalse,
       );
       // 哈希被篡改同样失败
       expect(
-        PasswordHasher.verify(
+        await PasswordHasher.verify(
           'right-password',
           salt,
           '${hash.substring(0, 62)}zz',

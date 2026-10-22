@@ -5,6 +5,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 
 import '../../core/constants.dart';
+import '../../core/network/server_probe.dart';
 import '../../core/network/server_resolver.dart';
 import '../../core/network/ws_client.dart';
 import '../../core/protocol/message_envelope.dart';
@@ -117,9 +118,12 @@ class ConnectionController extends Notifier<ConnectionUiState> {
       resolved.port,
       AppConstants.defaultPort,
     );
-    if (saved != formatted) {
-      // 旧地址不可达（或首次自动发现）：以可连通地址覆盖。
+    final savedSecure =
+        prefs.getBool(AppConstants.prefKeyServerSecure) ?? false;
+    if (saved != formatted || savedSecure != resolved.secure) {
+      // 旧地址不可达（或首次自动发现）：以可连通地址覆盖（含 TLS 标记）。
       await prefs.setString(AppConstants.prefKeyServerHost, formatted);
+      await prefs.setBool(AppConstants.prefKeyServerSecure, resolved.secure);
     }
     return resolved;
   }
@@ -155,6 +159,7 @@ class ConnectionController extends Notifier<ConnectionUiState> {
       }
       await connect(
         formatHostPort(resolved.host, resolved.port, AppConstants.defaultPort),
+        secure: resolved.secure,
       );
     } finally {
       _autoConnecting = false;
@@ -162,10 +167,11 @@ class ConnectionController extends Notifier<ConnectionUiState> {
     }
   }
 
-  /// 连接到「host[:port]」形式的地址；保存为上次使用的地址。
+  /// 连接到「host[:port]」形式的地址；保存为上次使用的地址（含 TLS 标记）。
   ///
   /// 需先登录：WS 接入携带账号 token（未登录时给出错误提示）。
-  Future<void> connect(String addressInput) async {
+  /// [secure] 为 null 时自动探测（TLS 优先），决定 wss/https 还是 ws/http。
+  Future<void> connect(String addressInput, {bool? secure}) async {
     final parsed = _parseAddress(addressInput);
     if (parsed == null) {
       state = state.copyWith(
@@ -187,6 +193,11 @@ class ConnectionController extends Notifier<ConnectionUiState> {
       return;
     }
     final (host, port) = parsed;
+    var isSecure = secure;
+    if (isSecure == null) {
+      final result = await probeServer(host, port);
+      isSecure = result.reachable && result.secure;
+    }
     final user = auth.user!;
     final deviceId = await ref.read(deviceIdProvider.future);
 
@@ -208,13 +219,16 @@ class ConnectionController extends Notifier<ConnectionUiState> {
       }
     });
     _msgSub = client.messages.listen(_onMessage);
-    await client.connect(Uri.parse('ws://$host:$port/ws'));
+    await client.connect(
+      Uri.parse('${isSecure ? 'wss' : 'ws'}://$host:$port/ws'),
+    );
 
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(
       AppConstants.prefKeyServerHost,
       formatHostPort(host, port, AppConstants.defaultPort),
     );
+    await prefs.setBool(AppConstants.prefKeyServerSecure, isSecure);
   }
 
   Future<void> disconnect() async {

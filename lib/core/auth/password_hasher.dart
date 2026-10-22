@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:isolate';
 import 'dart:math';
 
 import 'package:crypto/crypto.dart';
@@ -7,7 +8,9 @@ import 'package:crypto/crypto.dart';
 ///
 /// - 盐：[newSalt] 生成 16 字节随机盐，以 hex 形式存储；
 /// - 哈希：默认 100,000 次迭代、32 字节输出，以 hex 形式存储；
-/// - 校验：[verify] 使用常量时间比较，避免时序侧信道。
+/// - 校验：[verify] 使用常量时间比较，避免时序侧信道；
+/// - [hash]/[verify] 通过 [Isolate.run] 在独立 Isolate 中执行，10 万次迭代
+///   的纯计算不阻塞事件循环（服务端并发登录/注册时 WS 心跳与转发不受影响）。
 ///
 /// 纯 Dart 实现（基于 package:crypto 的 HMAC-SHA256），三端可用、无原生依赖。
 abstract final class PasswordHasher {
@@ -20,20 +23,25 @@ abstract final class PasswordHasher {
       _bytesToHex(_randomBytes(saltBytes, random));
 
   /// 计算密码哈希（hex 字符串）；[saltHex] 为 [newSalt] 产出的 hex 盐。
-  static String hash(
+  ///
+  /// PBKDF2 为计算密集操作，包入 [Isolate.run] 后台执行（入参均为可拷贝的
+  /// 简单值），默认 10 万次迭代约耗时数百毫秒，不能阻塞调用方事件循环。
+  static Future<String> hash(
     String password,
     String saltHex, {
     int iterations = defaultIterations,
-  }) => deriveHex(password, _hexToBytes(saltHex), iterations: iterations);
+  }) => Isolate.run(
+    () => deriveHex(password, _hexToBytes(saltHex), iterations: iterations),
+  );
 
   /// 常量时间比较哈希；任何参数不一致均返回 false，不泄露失败原因。
-  static bool verify(
+  static Future<bool> verify(
     String password,
     String saltHex,
     String expectedHashHex, {
     int iterations = defaultIterations,
-  }) {
-    final actual = hash(password, saltHex, iterations: iterations);
+  }) async {
+    final actual = await hash(password, saltHex, iterations: iterations);
     if (actual.length != expectedHashHex.length) {
       return false;
     }
@@ -62,15 +70,13 @@ abstract final class PasswordHasher {
     final derived = <int>[];
     for (var blockIndex = 1; blockIndex <= blockCount; blockIndex++) {
       // U1 = PRF(password, salt || INT_32_BE(blockIndex))
-      var u = mac
-          .convert(<int>[
-            ...salt,
-            (blockIndex >> 24) & 0xff,
-            (blockIndex >> 16) & 0xff,
-            (blockIndex >> 8) & 0xff,
-            blockIndex & 0xff,
-          ])
-          .bytes;
+      var u = mac.convert(<int>[
+        ...salt,
+        (blockIndex >> 24) & 0xff,
+        (blockIndex >> 16) & 0xff,
+        (blockIndex >> 8) & 0xff,
+        blockIndex & 0xff,
+      ]).bytes;
       // T = U1 ^ U2 ^ ... ^ Uc
       final t = List<int>.of(u);
       for (var round = 1; round < iterations; round++) {

@@ -3,7 +3,9 @@ import 'dart:async';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../../core/auth/token_store.dart';
 import '../../core/constants.dart';
+import '../../core/network/server_probe.dart';
 import '../../core/network/server_resolver.dart';
 import '../../core/protocol/message_envelope.dart';
 import '../connection/connection_providers.dart';
@@ -32,9 +34,18 @@ class AuthState {
   }
 }
 
+/// 登录 token 安全存储（R4）：默认按平台条件实现（IO 走
+/// flutter_secure_storage，Web 走 shared_preferences）；测试覆写为
+/// [InMemoryTokenStore]。
+final Provider<TokenStore> tokenStoreProvider = Provider<TokenStore>(
+  (ref) => PlatformTokenStore(),
+);
+
 /// 认证控制器：
-/// - 启动时从 shared_preferences 恢复 token 与账号资料；已保存服务器地址时
-///   先经 /api/me 校验，token 失效即清会话转登录页（阶段⑤「登录即连接」前置）；
+/// - 启动时经 [tokenStoreProvider] 恢复 token（R4 起不再明文写入
+///   shared_preferences；IO 端自动迁移旧版明文副本），账号资料仍存于
+///   shared_preferences；已保存服务器地址时先经 /api/me 校验，token
+///   失效即清会话转登录页（阶段⑤「登录即连接」前置）；
 /// - 注册/登录成功后持久化会话；
 /// - 登出时清空本地会话并断开 WS；
 /// - WS authFailed（token 失效/被踢）时自动登出，路由守卫随状态刷新转登录页。
@@ -54,7 +65,13 @@ class AuthController extends Notifier<AuthState> {
   ///   连接层重试失败会给到明确提示。
   Future<void> _restore() async {
     final prefs = await SharedPreferences.getInstance();
-    final token = prefs.getString(AppConstants.prefKeyAuthToken);
+    String? token;
+    try {
+      token = await ref.read(tokenStoreProvider).readToken();
+    } on Exception {
+      // 安全存储不可用（如平台通道异常）：按无会话处理，转登录页。
+      token = null;
+    }
     final userId = prefs.getString(AppConstants.prefKeyAuthUserId);
     if (token == null || token.isEmpty || userId == null || userId.isEmpty) {
       state = const AuthState(phase: AuthPhase.loggedOut);
@@ -72,7 +89,13 @@ class AuthController extends Notifier<AuthState> {
     }
     try {
       final profile = await _api
-          .me(_baseUrl(savedHost), token)
+          .me(
+            _baseUrlFor(
+              savedHost,
+              prefs.getBool(AppConstants.prefKeyServerSecure) ?? false,
+            ),
+            token,
+          )
           .timeout(const Duration(seconds: 3));
       // 校验通过：以服务端资料为准（昵称可能已被其他设备更新）。
       state = AuthState(phase: AuthPhase.loggedIn, user: profile, token: token);
@@ -112,7 +135,7 @@ class AuthController extends Notifier<AuthState> {
   }) async {
     final deviceId = await ref.read(deviceIdProvider.future);
     final result = await _api.register(
-      _baseUrl(address),
+      await _resolveBaseUrl(address),
       username: username,
       password: password,
       nickname: nickname,
@@ -129,7 +152,7 @@ class AuthController extends Notifier<AuthState> {
   }) async {
     final deviceId = await ref.read(deviceIdProvider.future);
     final result = await _api.login(
-      _baseUrl(address),
+      await _resolveBaseUrl(address),
       username: username,
       password: password,
       deviceId: deviceId,
@@ -144,9 +167,8 @@ class AuthController extends Notifier<AuthState> {
     if (token.isEmpty) {
       throw const AuthApiException('INVALID_TOKEN', '未登录');
     }
-    final savedHost = await _savedServerHost();
     final profile = await _api.updateNickname(
-      _baseUrl(savedHost),
+      await _savedServerBaseUrl(),
       token,
       nickname,
     );
@@ -163,9 +185,8 @@ class AuthController extends Notifier<AuthState> {
     if (token.isEmpty) {
       throw const AuthApiException('INVALID_TOKEN', '未登录');
     }
-    final savedHost = await _savedServerHost();
     final profile = await _api.changePassword(
-      _baseUrl(savedHost),
+      await _savedServerBaseUrl(),
       token,
       oldPassword: oldPassword,
       newPassword: newPassword,
@@ -173,14 +194,18 @@ class AuthController extends Notifier<AuthState> {
     await _applyProfile(profile);
   }
 
-  /// 已保存的服务器地址；缺失时按网络错误提示（设置页场景必然已连接过）。
-  Future<String> _savedServerHost() async {
+  /// 已保存的服务器地址对应的 REST 基址（按持久化的 secure 标记选 https/http）；
+  /// 缺失时按网络错误提示（设置页场景必然已连接过）。
+  Future<String> _savedServerBaseUrl() async {
     final prefs = await SharedPreferences.getInstance();
     final host = prefs.getString(AppConstants.prefKeyServerHost) ?? '';
     if (host.isEmpty) {
       throw const AuthApiException('NETWORK_ERROR', '尚未保存服务器地址，请先连接一次中继');
     }
-    return host;
+    return _baseUrlFor(
+      host,
+      prefs.getBool(AppConstants.prefKeyServerSecure) ?? false,
+    );
   }
 
   /// 服务端资料变更后同步本地持久化与会话状态。
@@ -212,6 +237,12 @@ class AuthController extends Notifier<AuthState> {
 
   /// 清空本地持久化的登录会话（token + 账号资料）。
   Future<void> _clearSession(SharedPreferences prefs) async {
+    try {
+      await ref.read(tokenStoreProvider).deleteToken();
+    } on Exception {
+      // 存储层异常不阻断登出流程。
+    }
+    // 清理旧版明文残留（Web 实现与该键同源，重复删除为安全空操作）。
     await prefs.remove(AppConstants.prefKeyAuthToken);
     await prefs.remove(AppConstants.prefKeyAuthUserId);
     await prefs.remove(AppConstants.prefKeyAuthUsername);
@@ -220,7 +251,7 @@ class AuthController extends Notifier<AuthState> {
 
   Future<void> _applySession(AuthResult result) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(AppConstants.prefKeyAuthToken, result.token);
+    await ref.read(tokenStoreProvider).writeToken(result.token);
     await prefs.setString(AppConstants.prefKeyAuthUserId, result.user.id);
     await prefs.setString(
       AppConstants.prefKeyAuthUsername,
@@ -237,19 +268,35 @@ class AuthController extends Notifier<AuthState> {
     );
   }
 
-  /// 「host[:port]」→「http://host[:port]」；缺省端口补默认值 9090，
-  /// 避免「127.0.0.1」这类输入落到 80 端口被拒绝。
-  String _baseUrl(String address) {
+  /// 「host[:port]」→「http(s)://host[:port]」（显式 scheme 直接透传）。
+  ///
+  /// [secure] 非空时按标记构造（恢复会话/改资料走持久化标记）；为 null 时
+  /// 先探测（TLS 优先，登录/注册首次连接场景），非 TLS 服务回落 http。
+  Future<String> _resolveBaseUrl(String address, {bool? secure}) async {
     final trimmed = address.trim();
     if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
       return trimmed;
     }
-    final parsed = parseHostPort(trimmed, AppConstants.defaultPort);
+    var isSecure = secure;
+    if (isSecure == null) {
+      final parsed = parseHostPort(trimmed, AppConstants.defaultPort);
+      if (parsed == null) {
+        throw const FormatException('地址格式无效，应为 host[:port]');
+      }
+      final result = await probeServer(parsed.$1, parsed.$2);
+      isSecure = result.reachable && result.secure;
+    }
+    return _baseUrlFor(trimmed, isSecure);
+  }
+
+  /// 按 secure 标记把「host[:port]」还原为带显式端口的 http(s) 基址。
+  String _baseUrlFor(String address, bool secure) {
+    final parsed = parseHostPort(address.trim(), AppConstants.defaultPort);
     if (parsed == null) {
       throw const FormatException('地址格式无效，应为 host[:port]');
     }
     final (host, port) = parsed;
-    return 'http://$host:$port';
+    return '${secure ? 'https' : 'http'}://$host:$port';
   }
 }
 

@@ -66,27 +66,36 @@ class HostServer {
   final Map<String, List<int>> _loginFailures = <String, List<int>>{};
   HttpServer? _http;
 
+  /// 非 null 时以 TLS（wss/https）监听（阶段 R1）。
+  SecurityContext? _securityContext;
+
   bool get isRunning => _http != null;
   int? get port => _http?.port;
 
+  /// 启动中继服务。
+  ///
+  /// 传入 [securityContext] 时以 TLS（HTTPS/WSS）监听，否则明文（HTTP/WS）。
   Future<RelayStatus> start({
     int port = AppConstants.defaultPort,
     required AccountStore accountStore,
     bool allowRegistration = true,
+    SecurityContext? securityContext,
   }) async {
     if (isRunning) {
-      return RelayStatus.running(_http!.port);
+      return RelayStatus.running(_http!.port, secure: _securityContext != null);
     }
     _accounts = accountStore;
     _allowRegistration = allowRegistration;
+    _securityContext = securityContext;
     try {
       final server = await shelf_io.serve(
         _handler,
         InternetAddress.anyIPv4,
         port,
+        securityContext: securityContext,
       );
       _http = server;
-      return RelayStatus.running(server.port);
+      return RelayStatus.running(server.port, secure: securityContext != null);
     } catch (error) {
       return RelayStatus.failure('中继服务启动失败（端口可能被占用）：$error');
     }

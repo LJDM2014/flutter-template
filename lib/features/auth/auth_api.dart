@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 
+import '../../core/network/tls_support.dart';
 import '../../core/protocol/message_envelope.dart';
 
 /// 认证接口异常：携带服务端错误码（INVALID_USERNAME / WEAK_PASSWORD /
@@ -34,6 +35,17 @@ class AuthApi {
   AuthApi({http.Client? client}) : _client = client ?? http.Client();
 
   final http.Client _client;
+
+  /// https（自签中继）专用客户端，懒创建（IO 平台接受自签证书）。
+  http.Client? _tlsClient;
+
+  /// 按请求协议选择客户端：https 走自签证书客户端，http/默认走普通客户端。
+  http.Client _clientFor(Uri url) {
+    if (url.scheme == 'https') {
+      return _tlsClient ??= createSelfSignedHttpClient();
+    }
+    return _client;
+  }
 
   /// 注册并登录（注册即登录，服务端直接签发 token）。
   Future<AuthResult> register(
@@ -69,11 +81,11 @@ class AuthApi {
 
   /// 用 token 拉取当前账号资料（会话恢复时校验 token 是否仍有效）。
   Future<UserProfile> me(String baseUrl, String token) async {
+    final url = Uri.parse('$baseUrl/api/me');
     final response = await _send(
-      () => _client.get(
-        Uri.parse('$baseUrl/api/me'),
-        headers: <String, String>{'Authorization': 'Bearer $token'},
-      ),
+      () => _clientFor(
+        url,
+      ).get(url, headers: <String, String>{'Authorization': 'Bearer $token'}),
     );
     final body = _decode(response);
     if (response.statusCode != 200) {
@@ -128,9 +140,10 @@ class AuthApi {
     Map<String, dynamic> body, {
     String token = '',
   }) async {
+    final uri = Uri.parse(url);
     final response = await _send(
-      () => _client.post(
-        Uri.parse(url),
+      () => _clientFor(uri).post(
+        uri,
         headers: <String, String>{
           'Content-Type': 'application/json',
           if (token.isNotEmpty) 'Authorization': 'Bearer $token',

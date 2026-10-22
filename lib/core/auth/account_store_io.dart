@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
+import 'package:crypto/crypto.dart';
 import 'package:uuid/uuid.dart';
 
 import 'account_store.dart';
@@ -35,8 +36,9 @@ class JsonFileAccountStore implements AccountStore {
 
   final Map<String, AccountUser> _users =
       <String, AccountUser>{}; // 键 = username
-  final Map<String, AuthSession> _sessions =
-      <String, AuthSession>{}; // 键 = token
+  // 键 = token 的 SHA-256 摘要（R4：明文 token 不落盘，校验时对来方
+  // token 做同样摘要后比对）。
+  final Map<String, AuthSession> _sessions = <String, AuthSession>{};
   final Map<String, OfflineMessage> _offline =
       <String, OfflineMessage>{}; // 键 = msgId
   bool _loaded = false;
@@ -67,15 +69,16 @@ class JsonFileAccountStore implements AccountStore {
     }
     final trimmedNickname = nickname?.trim() ?? '';
     final salt = PasswordHasher.newSalt(_random);
+    final passwordHash = await PasswordHasher.hash(
+      password,
+      salt,
+      iterations: pbkdf2Iterations,
+    );
     final user = AccountUser(
       id: const Uuid().v4(),
       username: name,
       nickname: trimmedNickname.isEmpty ? name : trimmedNickname,
-      passwordHash: PasswordHasher.hash(
-        password,
-        salt,
-        iterations: pbkdf2Iterations,
-      ),
+      passwordHash: passwordHash,
       salt: salt,
       createdAt: _now(),
     );
@@ -93,13 +96,15 @@ class JsonFileAccountStore implements AccountStore {
     await _ensureLoaded();
     final user = _users[username.trim()];
     // 用户不存在与密码错误统一报错，避免用户名枚举。
-    if (user == null ||
-        !PasswordHasher.verify(
+    final passwordOk =
+        user != null &&
+        await PasswordHasher.verify(
           password,
           user.salt,
           user.passwordHash,
           iterations: pbkdf2Iterations,
-        )) {
+        );
+    if (!passwordOk) {
       throw const AccountException('BAD_CREDENTIALS', '用户名或密码错误');
     }
     _sessions.removeWhere(
@@ -113,8 +118,10 @@ class JsonFileAccountStore implements AccountStore {
       );
     }
     final now = _now();
+    final token = _newToken();
+    // 库内只持久化 token 摘要；明文 token 仅在返回值中出现一次（R4）。
     final session = AuthSession(
-      token: _newToken(),
+      token: _tokenDigest(token),
       userId: user.id,
       deviceId: deviceId,
       createdAt: now,
@@ -122,7 +129,13 @@ class JsonFileAccountStore implements AccountStore {
     );
     _sessions[session.token] = session;
     await _persist(_sessionsFile, _sessions.values);
-    return session;
+    return AuthSession(
+      token: token,
+      userId: session.userId,
+      deviceId: session.deviceId,
+      createdAt: session.createdAt,
+      expiresAt: session.expiresAt,
+    );
   });
 
   @override
@@ -131,12 +144,13 @@ class JsonFileAccountStore implements AccountStore {
     required String userId,
   }) => _synchronized(() async {
     await _ensureLoaded();
-    final session = _sessions[token];
+    final digest = _tokenDigest(token);
+    final session = _sessions[digest];
     if (session == null) {
       return null;
     }
     if (session.isExpired) {
-      _sessions.remove(token);
+      _sessions.remove(digest);
       await _persist(_sessionsFile, _sessions.values);
       return null;
     }
@@ -157,12 +171,13 @@ class JsonFileAccountStore implements AccountStore {
   Future<AccountUser?> getUserByToken({required String token}) =>
       _synchronized(() async {
         await _ensureLoaded();
-        final session = _sessions[token];
+        final digest = _tokenDigest(token);
+        final session = _sessions[digest];
         if (session == null) {
           return null;
         }
         if (session.isExpired) {
-          _sessions.remove(token);
+          _sessions.remove(digest);
           await _persist(_sessionsFile, _sessions.values);
           return null;
         }
@@ -180,7 +195,7 @@ class JsonFileAccountStore implements AccountStore {
 
   /// 按 token 取有效会话（过期视为无效；过期清理交给按需路径处理）。
   AuthSession? _sessionByToken(String token) {
-    final session = _sessions[token];
+    final session = _sessions[_tokenDigest(token)];
     if (session == null || session.isExpired) {
       return null;
     }
@@ -227,33 +242,36 @@ class JsonFileAccountStore implements AccountStore {
     if (user == null) {
       throw const AccountException('INVALID_TOKEN', '凭证无效或已过期');
     }
-    if (!PasswordHasher.verify(
+    final oldPasswordOk = await PasswordHasher.verify(
       oldPassword,
       user.salt,
       user.passwordHash,
       iterations: pbkdf2Iterations,
-    )) {
+    );
+    if (!oldPasswordOk) {
       throw const AccountException('BAD_CREDENTIALS', '旧密码错误');
     }
     if (newPassword.length < 8) {
       throw const AccountException('WEAK_PASSWORD', '密码至少需要 8 位');
     }
     final salt = PasswordHasher.newSalt(_random);
+    final passwordHash = await PasswordHasher.hash(
+      newPassword,
+      salt,
+      iterations: pbkdf2Iterations,
+    );
     final updated = AccountUser(
       id: user.id,
       username: user.username,
       nickname: user.nickname,
-      passwordHash: PasswordHasher.hash(
-        newPassword,
-        salt,
-        iterations: pbkdf2Iterations,
-      ),
+      passwordHash: passwordHash,
       salt: salt,
       createdAt: user.createdAt,
     );
     _users[user.username] = updated;
     // 吊销该用户其他设备的会话，当前 token 保持有效（改密后其他设备需重登）。
-    _sessions.removeWhere((t, s) => s.userId == user.id && t != token);
+    final currentDigest = _tokenDigest(token);
+    _sessions.removeWhere((t, s) => s.userId == user.id && t != currentDigest);
     await _persist(_usersFile, _users.values);
     await _persist(_sessionsFile, _sessions.values);
     return updated;
@@ -303,6 +321,11 @@ class JsonFileAccountStore implements AccountStore {
 
   String _newToken() =>
       _bytesToHex(<int>[for (var i = 0; i < 32; i++) _random.nextInt(256)]);
+
+  /// token 的 SHA-256 摘要（hex）：会话持久化的唯一形态（R4），
+  /// sessions.json 泄露不再等于身份泄露。
+  static String _tokenDigest(String token) =>
+      sha256.convert(utf8.encode(token)).toString();
 
   Future<void> _ensureLoaded() async {
     if (_loaded) {
@@ -377,15 +400,24 @@ class JsonFileAccountStore implements AccountStore {
   static int _now() => DateTime.now().millisecondsSinceEpoch;
 }
 
-/// 便捷构造：默认使用 JSON 文件账号库（目录不存在时自动创建）。
+/// 应用数据根目录（Windows: %APPDATA%/LanMessenger；其余: ~/LanMessenger）。
 ///
-/// 供桌面端启动使用；阶段② MVP 存储。
-Future<AccountStore> createDefaultAccountStore() async {
+/// 供账号库与中继自签证书等落盘数据共同使用。
+Future<Directory> defaultAppDataDirectory() async {
   final base =
       Platform.environment['APPDATA'] ??
       Platform.environment['HOME'] ??
       Directory.systemTemp.path;
-  final dir = Directory('$base/LanMessenger/accounts');
+  final dir = Directory('$base/LanMessenger');
+  await dir.create(recursive: true);
+  return dir;
+}
+
+/// 便捷构造：默认使用 JSON 文件账号库（目录不存在时自动创建）。
+///
+/// 供桌面端启动使用；阶段② MVP 存储。
+Future<AccountStore> createDefaultAccountStore() async {
+  final dir = Directory('${(await defaultAppDataDirectory()).path}/accounts');
   await dir.create(recursive: true);
   return JsonFileAccountStore(dir);
 }

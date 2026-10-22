@@ -55,13 +55,19 @@ Future<TestAccount> registerAccount(
   String nickname = '',
   String deviceId = '',
   String password = 'password1',
+  bool secure = false,
 }) async {
-  final (status, body) = await postJson(port, 'api/register', <String, dynamic>{
-    'username': username,
-    'password': password,
-    if (nickname.isNotEmpty) 'nickname': nickname,
-    'deviceId': deviceId,
-  });
+  final (status, body) = await postJson(
+    port,
+    'api/register',
+    <String, dynamic>{
+      'username': username,
+      'password': password,
+      if (nickname.isNotEmpty) 'nickname': nickname,
+      'deviceId': deviceId,
+    },
+    secure: secure,
+  );
   if (status != 200) {
     throw StateError('注册失败($status)：$body');
   }
@@ -74,12 +80,14 @@ Future<TestAccount> loginAccount(
   String username, {
   String deviceId = '',
   String password = 'password1',
+  bool secure = false,
 }) async {
-  final (status, body) = await postJson(port, 'api/login', <String, dynamic>{
-    'username': username,
-    'password': password,
-    'deviceId': deviceId,
-  });
+  final (status, body) = await postJson(
+    port,
+    'api/login',
+    <String, dynamic>{'username': username, 'password': password, 'deviceId': deviceId},
+    secure: secure,
+  );
   if (status != 200) {
     throw StateError('登录失败($status)：$body');
   }
@@ -87,16 +95,20 @@ Future<TestAccount> loginAccount(
 }
 
 /// POST JSON（可带 Bearer），返回 (状态码, 响应体)。
+///
+/// [secure] 为 true 时走 https 并接受自签证书（TLS 中继测试用）。
 Future<(int, Map<String, dynamic>)> postJson(
   int port,
   String path,
   Map<String, dynamic> payload, {
   String? bearer,
+  bool secure = false,
 }) => _withRealHttp(() async {
-  final client = HttpClient();
+  final client = HttpClient()
+    ..badCertificateCallback = secure ? (_, _, _) => true : null;
   try {
     final request = await client.postUrl(
-      Uri.parse('http://127.0.0.1:$port/$path'),
+      Uri.parse('${secure ? 'https' : 'http'}://127.0.0.1:$port/$path'),
     );
     request.headers.contentType = ContentType.json;
     if (bearer != null) {
@@ -111,15 +123,19 @@ Future<(int, Map<String, dynamic>)> postJson(
 });
 
 /// GET（可带 Bearer），返回 (状态码, 响应体)。
+///
+/// [secure] 为 true 时走 https 并接受自签证书（TLS 中继测试用）。
 Future<(int, Map<String, dynamic>)> getJson(
   int port,
   String path, {
   String? bearer,
+  bool secure = false,
 }) => _withRealHttp(() async {
-  final client = HttpClient();
+  final client = HttpClient()
+    ..badCertificateCallback = secure ? (_, _, _) => true : null;
   try {
     final request = await client.getUrl(
-      Uri.parse('http://127.0.0.1:$port/$path'),
+      Uri.parse('${secure ? 'https' : 'http'}://127.0.0.1:$port/$path'),
     );
     if (bearer != null) {
       request.headers.set(HttpHeaders.authorizationHeader, 'Bearer $bearer');
